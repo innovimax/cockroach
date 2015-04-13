@@ -212,7 +212,6 @@ var _ multiraft.WriteableGroupStorage = &Range{}
 func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
 	r := &Range{
 		rm:          rm,
-		closer:      make(chan struct{}),
 		cmdQ:        NewCommandQueue(),
 		tsCache:     NewTimestampCache(rm.Clock()),
 		respCache:   NewResponseCache(desc.RaftID, rm.Engine()),
@@ -761,7 +760,7 @@ func (r *Range) startGossip(term uint64, stopper *util.Stopper) {
 				}
 				r.maybeGossipClusterID()
 				r.maybeGossipFirstRange()
-			case <-stopper().ShouldStop():
+			case <-stopper.ShouldStop():
 				return
 			}
 		}
