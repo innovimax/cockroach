@@ -95,11 +95,6 @@ const (
 	defaultLeaderLeaseDuration = time.Second
 )
 
-// leaderLeaseGracePeriodNanos is the additional duration in
-// nanoseconds to add to another replica's lease expiration before
-// trying to propose new Raft commands from this replica.
-const leaderLeaseGracePeriodNanos = 1 * 1E9 // 1s
-
 // configDescriptor describes administrative configuration maps
 // affecting ranges of the key-value map by key prefix.
 type configDescriptor struct {
@@ -319,12 +314,11 @@ func (r *Range) HasLeaderLease() (bool, uint64) {
 }
 
 // AnotherHasLeaderLease returns whether a replica other than this one
-// is known to be the holder of the lease. We use a grace period to
-// drown out clock offsets and provide hysteresis.
+// is known to be the holder of the lease. We account for clock offset.
 func (r *Range) AnotherHasLeaderLease() bool {
 	if l := r.getLease(); l != nil {
 		if l.RaftNodeID != uint64(r.rm.RaftNodeID()) &&
-			r.rm.Clock().PhysicalNow() < l.Expiration+leaderLeaseGracePeriodNanos {
+			r.rm.Clock().PhysicalNow() < l.Expiration+int64(r.rm.Clock().MaxOffset()) {
 			return true
 		}
 	}
@@ -342,32 +336,44 @@ func (r *Range) AnotherHasLeaderLease() bool {
 // TODO(tobias): call this method when processing the lease command
 // in Range.executeCmd().
 func (r *Range) setLeaderLease(lease *proto.Lease) {
+	r.Lock()
+	defer r.Unlock()
+
 	// Set the new leader lease.
-	var oldTerm uint64
-	if l := r.getLease(); l != nil {
-		oldTerm = l.Term
+	oldLease := r.getLease()
+	if oldLease != nil && lease.Term < oldLease.Term {
+		return
 	}
-	if lease.Term >= oldTerm {
-		atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
-	}
+	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
 
 	// If this replica holds the lease and it's being granted as part of
-	// a new term, as opposed to renewed before having expired, clear
-	// the timestamp cache and start gossiping if we're the first range.
-	if held, _ := r.HasLeaderLease(); held && lease.Term > oldTerm {
-		r.Lock()
-		defer r.Unlock()
-		r.cmdQ.Clear()
-		r.tsCache.Clear(r.rm.Clock())
-
-		// Gossip configs in the event this range contains config info.
-		r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
-			return r.ContainsKey(configPrefix)
-		})
-		// Only start gossiping if this range is the first range.
-		if r.IsFirstRange() {
-			go r.startGossip(lease.Term, r.rm.Stopper())
+	// a new term, as opposed to renewed before having expired, start
+	// gossiping if we're the first range.
+	if held, term := r.HasLeaderLease(); held {
+		if oldLease == nil || term > oldLease.Term {
+			// Gossip configs in the event this range contains config info.
+			r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
+				return r.ContainsKey(configPrefix)
+			})
+			// Only start gossiping if this range is the first range.
+			if r.IsFirstRange() {
+				go r.startGossip(lease.Term, r.rm.Stopper())
+			}
 		}
+		// Update the low water mark in the timestamp cache if the prior
+		// lease holder was not this replica. We add the maximum clock
+		// offset to account for any difference in clocks between the
+		// expiration (set by a remote node) and this node.
+		if oldLease != nil && oldLease.RaftNodeID != lease.RaftNodeID {
+			r.tsCache.SetLowWater(proto.Timestamp{
+				WallTime: oldLease.Expiration + int64(r.rm.Clock().MaxOffset()),
+			})
+		}
+	} else {
+		// Clear the command queue as another replica has the lease. All
+		// waiting read-only commands will be freed up to complete, and
+		// will fail with NotLeaderError.
+		r.cmdQ.Clear()
 	}
 }
 
@@ -595,11 +601,10 @@ func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.R
 
 	// For read/write commands, we check the leader lease. If we know of
 	// a lease and the holder is not this replica, and we're within the
-	// lease grace period of its expiration, return NotLeaderError. In
-	// all other cases, we want to continue. Either we're the lease
-	// holder, or were the last lease holder, or we weren't the last but
-	// we'd like to become the leader because this replica is where the
-	// write pressure is happening.
+	// lease expiration, return NotLeaderError. In all other cases, we
+	// want to continue. Either we're the lease holder, or were the last
+	// lease holder, or we weren't the last but we'd like to become the
+	// leader because this replica is where there's write pressure.
 	if r.AnotherHasLeaderLease() {
 		reply.Header().SetGoError(r.newNotLeaderError())
 		return reply.Header().GoError()

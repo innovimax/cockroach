@@ -359,6 +359,7 @@ func TestRangeAnotherHasLeaderLease(t *testing.T) {
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
+	tc.clock.SetMaxOffset(maxClockOffset)
 
 	if tc.rng.AnotherHasLeaderLease() {
 		t.Errorf("expected current replica to have leader lease")
@@ -378,7 +379,7 @@ func TestRangeAnotherHasLeaderLease(t *testing.T) {
 	if !tc.rng.AnotherHasLeaderLease() {
 		t.Errorf("expected another replica to still have leader lease due to grace period")
 	}
-	tc.manualClock.Set(11 + leaderLeaseGracePeriodNanos)
+	tc.manualClock.Set(11 + int64(tc.clock.MaxOffset()))
 	if tc.rng.AnotherHasLeaderLease() {
 		t.Errorf("expected expiration of other replica's leader lease")
 	}
@@ -495,6 +496,56 @@ func TestRangeGossipConfigsOnLease(t *testing.T) {
 	if !verifyPerm() {
 		t.Errorf("expected gossip of new config")
 	}
+}
+
+// TestRangeTSCacheLowWaterOnLease verifies that the low water mark is
+// set on the timestamp cache when the node is granted the leader
+// lease after not holding it and it is not set when the node is
+// granted the leader lease when it was the last holder.
+func TestRangeTSCacheLowWaterOnLease(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+	tc.clock.SetMaxOffset(maxClockOffset)
+
+	testCases := []struct {
+		priorHolder multiraft.NodeID
+		newHolder   multiraft.NodeID
+		priorTerm   uint64
+		newTerm     uint64
+		expLowWater int64
+	}{
+		// Lease is granted fresh.
+		{MakeRaftNodeID(2, 2), tc.store.RaftNodeID(), 1, 2, 5 + int64(maxClockOffset)},
+		// Lease is granted fresh to another.
+		{tc.store.RaftNodeID(), MakeRaftNodeID(2, 2), 1, 2, int64(maxClockOffset)},
+		// Lease is renewed.
+		{tc.store.RaftNodeID(), tc.store.RaftNodeID(), 1, 1, int64(maxClockOffset)},
+	}
+
+	for i, test := range testCases {
+		// Set prior lease.
+		tc.rng.setLeaderLease(&proto.Lease{
+			Expiration: 5,
+			RaftNodeID: uint64(test.priorHolder),
+			Term:       test.priorTerm,
+		})
+		// Reset the timestamp cache.
+		tc.rng.tsCache.Clear(tc.clock)
+		// Set new lease.
+		tc.rng.setLeaderLease(&proto.Lease{
+			Expiration: 50,
+			RaftNodeID: uint64(test.newHolder),
+			Term:       test.newTerm,
+		})
+		// Verify expected low water mark.
+		rTS, wTS := tc.rng.tsCache.GetMax(proto.Key("a"), nil, proto.NoTxnMD5)
+		if rTS.WallTime != test.expLowWater || wTS.WallTime != test.expLowWater {
+			t.Errorf("%d: expected low water %d; got %d, %d", i, test.expLowWater, rTS.WallTime, wTS.WallTime)
+		}
+	}
+
 }
 
 // TestRangeGossipFirstRange verifies that the first range gossips its

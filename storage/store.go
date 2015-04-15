@@ -1123,21 +1123,6 @@ func (s *Store) ProposeRaftCommand(idKey cmdIDKey, cmd proto.InternalRaftCommand
 // by the raft consensus algorithm, dispatching them to the
 // appropriate range. This method starts a goroutine to process Raft
 // commands indefinitely or until the stopper signals.
-//
-// TODO(bdarnell): when Raft elects this node as the leader for any
-//   of its ranges, we need to be careful to do the following before
-//   the range is allowed to believe it's the leader and begin to accept
-//   writes and reads:
-//     - Apply all committed log entries to the state machine.
-//     - Signal the range to clear its read timestamp, response caches
-//       and pending read queue.
-//     - Signal the range that it's now the leader with the duration
-//       of its leader lease.
-//   If we don't do this, then a read which was previously gated on
-//   the former leader waiting for overlapping writes to commit to
-//   the underlying state machine, might transit to the new leader
-//   and be able to access the new leader's state machine BEFORE
-//   the overlapping writes are applied.
 func (s *Store) processRaft() {
 	s.stopper.RunWorker(func() {
 		for {
