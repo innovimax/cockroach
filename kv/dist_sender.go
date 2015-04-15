@@ -554,8 +554,10 @@ func (ds *DistSender) Send(call *client.Call) {
 					// On addressing errors, don't backoff; retry immediately.
 					return util.RetryReset, nil
 				case *proto.NotLeaderError:
-					ds.updateLeaderCache(proto.RaftID(desc.RaftID),
-						err.(*proto.NotLeaderError).GetLeader())
+					leader := err.(*proto.NotLeaderError).GetLeader()
+					if leader != nil {
+						ds.updateLeaderCache(proto.RaftID(desc.RaftID), *leader)
+					}
 					return util.RetryReset, nil
 				default:
 					if retryErr, ok := err.(util.Retryable); ok && retryErr.CanRetry() {
