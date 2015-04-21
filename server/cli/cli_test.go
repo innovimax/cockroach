@@ -35,7 +35,7 @@ func newCLITest() cliTest {
 	osStderr = os.Stdout
 
 	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
+	if err := s.Start(nil); err != nil {
 		log.Fatalf("Could not start server: %v", err)
 	}
 

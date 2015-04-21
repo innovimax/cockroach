@@ -18,6 +18,7 @@
 package server
 
 import (
+	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/gossip"
@@ -32,9 +33,7 @@ import (
 // node with a single store. Example usage of a TestServer follows:
 //
 //   s := &server.TestServer{}
-//   if err := s.Start(); err != nil {
-//     t.Fatal(err)
-//   }
+//   s.Start(t)
 //   defer s.Stop()
 //
 // TODO(spencer): add support for multiple stores.
@@ -77,7 +76,7 @@ func (ts *TestServer) Clock() *hlc.Clock {
 // node RPC server and all HTTP endpoints. Use the value of
 // TestServer.Addr after Start() for client connections. Use Stop()
 // to shutdown the server after the test completes.
-func (ts *TestServer) Start() error {
+func (ts *TestServer) Start(t testing.TB) error {
 	// We update these with the actual port once the servers
 	// have been launched for the purpose of this test.
 	if ts.Addr == "" {
@@ -92,7 +91,10 @@ func (ts *TestServer) Start() error {
 	var err error
 	ts.Server, err = NewServer(ctx, util.NewStopper())
 	if err != nil {
-		return util.Errorf("could not init server: %s", err)
+		if t != nil {
+			t.Fatal(err)
+		}
+		return err
 	}
 
 	if ts.Engine == nil {
@@ -103,18 +105,23 @@ func (ts *TestServer) Start() error {
 		stopper := util.NewStopper()
 		_, err := BootstrapCluster("cluster-1", ts.Engine, stopper)
 		if err != nil {
-			return util.Errorf("could not bootstrap cluster: %s", err)
+			if t != nil {
+				t.Fatalf("could not bootstrap cluster: %s", err)
+			}
+			return err
 		}
 		stopper.Stop()
 	}
 	err = ts.Server.Start(true)
 	if err != nil {
-		return util.Errorf("could not start server: %s", err)
+		if t != nil {
+			t.Fatalf("could not start server: %s", err)
+		}
+		return err
 	}
 	// Update the configuration variables to reflect the actual
 	// ports bound.
 	ts.Addr = ts.rpc.Addr().String()
-
 	return nil
 }
 

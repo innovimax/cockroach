@@ -178,8 +178,7 @@ func (tc *testContext) Start(t *testing.T) {
 		// Make sure that the group is running.
 		// MultiRaft will automatically elect a leader if the group contains
 		// only one member.
-		tc.store.startGroup(1)
-		tc.rng.WaitForElection()
+		tc.store.WaitForRange(1, t)
 	}
 }
 
@@ -253,6 +252,17 @@ func TestRangeContains(t *testing.T) {
 	}
 }
 
+func setLeaderLease(r *Range, l *proto.Lease, t *testing.T) {
+	req := &proto.InternalLeaderLeaseRequest{Lease: *l}
+	reply := &proto.InternalLeaderLeaseResponse{}
+	if err := r.executeCmd(0, proto.InternalLeaderLease, req, reply); err != nil {
+		t.Log(err)
+	}
+}
+
+// TestRangeReadConsistency verifies behavior of the range under
+// different read consistencies. Note that this unittest plays
+// fast and loose with granting leader leases.
 func TestRangeReadConsistency(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	tc := testContext{}
@@ -282,11 +292,11 @@ func TestRangeReadConsistency(t *testing.T) {
 
 	// Lose the lease and verify CONSISTENT reads receive NotLeaderError
 	// and INCONSISTENT reads work as expected.
-	tc.rng.setLeaderLease(&proto.Lease{
+	setLeaderLease(tc.rng, &proto.Lease{
 		Expiration: 10,
 		RaftNodeID: uint64(MakeRaftNodeID(2, 2)), // a different node
-		Term:       2,
-	})
+		Term:       tc.rng.getLease().Term + 1,
+	}, t)
 	gArgs.ReadConsistency = proto.CONSISTENT
 	gArgs.Txn = nil
 	err = tc.rng.AddCmd(proto.Get, gArgs, gReply, true)
@@ -298,11 +308,16 @@ func TestRangeReadConsistency(t *testing.T) {
 	if err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true); err != nil {
 		t.Errorf("expected success reading with inconsistent: %s", err)
 	}
+}
 
-	// Verify range checking.
+func TestRangeRangeBoundsChecking(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
 	splitTestRange(tc.store, proto.Key("a"), proto.Key("a"), t)
-	gArgs.Key = proto.Key("b")
-	gArgs.Txn = nil
+	gArgs, gReply := getArgs(proto.Key("b"), 1, tc.store.StoreID())
 	err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true)
 	if _, ok := err.(*proto.RangeKeyMismatchError); !ok {
 		t.Errorf("expected range key mismatch error: %s", err)
@@ -315,9 +330,11 @@ func TestRangeSetLeaderLease(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	if tc.rng.getLease() == nil {
+	oLease := tc.rng.getLease()
+	if oLease == nil {
 		t.Error("expected lease to be set")
 	}
+	oTerm := oLease.Term
 
 	tc.manualClock.Set(10) // time is 10ns
 	testCases := []struct {
@@ -327,13 +344,13 @@ func TestRangeSetLeaderLease(t *testing.T) {
 		expHasLease bool
 	}{
 		// Start new lease with expiration at current time.
-		{term: 2, expiration: 10, expIdx: 0, expHasLease: false},
+		{term: oTerm + 1, expiration: 10, expIdx: 0, expHasLease: false},
 		// Prior term with expiration later; should not have lease.
-		{term: 1, expiration: 11, expIdx: 0, expHasLease: false},
+		{term: oTerm, expiration: 11, expIdx: 0, expHasLease: false},
 		// Same term, with expiration later; should get lease.
-		{term: 2, expiration: 11, expIdx: 2, expHasLease: true},
+		{term: oTerm + 1, expiration: 11, expIdx: 2, expHasLease: true},
 		// Later term with expiration earlier; should lose lease.
-		{term: 3, expiration: 9, expIdx: 3, expHasLease: false},
+		{term: oTerm + 2, expiration: 9, expIdx: 3, expHasLease: false},
 	}
 
 	leases := []*proto.Lease{}
@@ -344,8 +361,8 @@ func TestRangeSetLeaderLease(t *testing.T) {
 			Term:       test.term,
 		}
 		leases = append(leases, l)
-		tc.rng.setLeaderLease(l)
-		if tc.rng.getLease() != leases[test.expIdx] {
+		setLeaderLease(tc.rng, l, t)
+		if !reflect.DeepEqual(tc.rng.getLease(), leases[test.expIdx]) {
 			t.Errorf("%d: expected lease %s, got %s", i, leases[test.expIdx], tc.rng.getLease())
 		}
 		if held, _ := tc.rng.HasLeaderLease(); held != test.expHasLease {
@@ -361,26 +378,26 @@ func TestRangeAnotherHasLeaderLease(t *testing.T) {
 	defer tc.Stop()
 	tc.clock.SetMaxOffset(maxClockOffset)
 
-	if tc.rng.AnotherHasLeaderLease() {
+	if held, _ := tc.rng.AnotherHasLeaderLease(); held {
 		t.Errorf("expected current replica to have leader lease")
 	}
-	tc.rng.setLeaderLease(&proto.Lease{
+	setLeaderLease(tc.rng, &proto.Lease{
 		Expiration: 10,
 		RaftNodeID: uint64(MakeRaftNodeID(2, 2)),
-		Term:       2,
-	})
-	if !tc.rng.AnotherHasLeaderLease() {
+		Term:       tc.rng.getLease().Term + 1,
+	}, t)
+	if held, expired := tc.rng.AnotherHasLeaderLease(); !held || expired {
 		t.Errorf("expected another replica to have leader lease")
 	}
 
 	// Advance clock past expiration and verify that another has
 	// leader lease will still be true up to the grace period.
 	tc.manualClock.Set(11) // time is 11ns
-	if !tc.rng.AnotherHasLeaderLease() {
+	if held, expired := tc.rng.AnotherHasLeaderLease(); !held || expired {
 		t.Errorf("expected another replica to still have leader lease due to grace period")
 	}
 	tc.manualClock.Set(11 + int64(tc.clock.MaxOffset()))
-	if tc.rng.AnotherHasLeaderLease() {
+	if held, expired := tc.rng.AnotherHasLeaderLease(); !held || !expired {
 		t.Errorf("expected expiration of other replica's leader lease")
 	}
 }
@@ -391,11 +408,11 @@ func TestRangeNotLeaderError(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	tc.rng.setLeaderLease(&proto.Lease{
+	setLeaderLease(tc.rng, &proto.Lease{
 		Expiration: 10,
 		RaftNodeID: uint64(MakeRaftNodeID(2, 2)),
-		Term:       2,
-	})
+		Term:       tc.rng.getLease().Term + 1,
+	}, t)
 
 	header := proto.RequestHeader{
 		Key:     proto.Key("a"),
@@ -453,11 +470,11 @@ func TestRangeGossipConfigsOnLease(t *testing.T) {
 	defer tc.Stop()
 
 	// Give lease to someone else to start.
-	tc.rng.setLeaderLease(&proto.Lease{
+	setLeaderLease(tc.rng, &proto.Lease{
 		Expiration: 10,
 		RaftNodeID: 10, // a different node
-		Term:       1,
-	})
+		Term:       tc.rng.getLease().Term + 1,
+	}, t)
 
 	// Add a permission for a new key prefix.
 	db1Perm := proto.PermConfig{
@@ -488,11 +505,11 @@ func TestRangeGossipConfigsOnLease(t *testing.T) {
 	}
 
 	// Give lease to this range.
-	tc.rng.setLeaderLease(&proto.Lease{
+	setLeaderLease(tc.rng, &proto.Lease{
 		Expiration: 10,
 		RaftNodeID: uint64(tc.store.RaftNodeID()),
-		Term:       2,
-	})
+		Term:       tc.rng.getLease().Term + 1,
+	}, t)
 	if !verifyPerm() {
 		t.Errorf("expected gossip of new config")
 	}
@@ -509,6 +526,7 @@ func TestRangeTSCacheLowWaterOnLease(t *testing.T) {
 	defer tc.Stop()
 	tc.clock.SetMaxOffset(maxClockOffset)
 
+	term := tc.rng.getLease().Term
 	testCases := []struct {
 		priorHolder multiraft.NodeID
 		newHolder   multiraft.NodeID
@@ -517,35 +535,34 @@ func TestRangeTSCacheLowWaterOnLease(t *testing.T) {
 		expLowWater int64
 	}{
 		// Lease is granted fresh.
-		{MakeRaftNodeID(2, 2), tc.store.RaftNodeID(), 1, 2, 5 + int64(maxClockOffset)},
+		{MakeRaftNodeID(2, 2), tc.store.RaftNodeID(), term + 1, term + 2, 5 + int64(maxClockOffset)},
 		// Lease is granted fresh to another.
-		{tc.store.RaftNodeID(), MakeRaftNodeID(2, 2), 1, 2, int64(maxClockOffset)},
+		{tc.store.RaftNodeID(), MakeRaftNodeID(2, 2), term + 1, term + 2, int64(maxClockOffset)},
 		// Lease is renewed.
-		{tc.store.RaftNodeID(), tc.store.RaftNodeID(), 1, 1, int64(maxClockOffset)},
+		{tc.store.RaftNodeID(), tc.store.RaftNodeID(), term + 1, term + 1, int64(maxClockOffset)},
 	}
 
 	for i, test := range testCases {
 		// Set prior lease.
-		tc.rng.setLeaderLease(&proto.Lease{
+		setLeaderLease(tc.rng, &proto.Lease{
 			Expiration: 5,
 			RaftNodeID: uint64(test.priorHolder),
 			Term:       test.priorTerm,
-		})
+		}, t)
 		// Reset the timestamp cache.
 		tc.rng.tsCache.Clear(tc.clock)
 		// Set new lease.
-		tc.rng.setLeaderLease(&proto.Lease{
+		setLeaderLease(tc.rng, &proto.Lease{
 			Expiration: 50,
 			RaftNodeID: uint64(test.newHolder),
 			Term:       test.newTerm,
-		})
+		}, t)
 		// Verify expected low water mark.
 		rTS, wTS := tc.rng.tsCache.GetMax(proto.Key("a"), nil, proto.NoTxnMD5)
 		if rTS.WallTime != test.expLowWater || wTS.WallTime != test.expLowWater {
 			t.Errorf("%d: expected low water %d; got %d, %d", i, test.expLowWater, rTS.WallTime, wTS.WallTime)
 		}
 	}
-
 }
 
 // TestRangeGossipFirstRange verifies that the first range gossips its

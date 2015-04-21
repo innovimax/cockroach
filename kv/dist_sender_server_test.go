@@ -42,10 +42,7 @@ import (
 // proceed in the event that a write intent is extant at the meta
 // index record being read.
 func TestRangeLookupWithOpenTransaction(t *testing.T) {
-	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatal(err)
-	}
+	s := startServer(t)
 	defer s.Stop()
 	sender := client.NewHTTPSender(s.Addr, &http.Transport{
 		TLSClientConfig: rpc.LoadInsecureTLSConfig().Config(),
@@ -90,10 +87,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 // The caller is responsible for stopping the server and
 // closing the client.
 func setupMultipleRanges(t *testing.T) (*server.TestServer, *client.KV) {
-	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatal(err)
-	}
+	s := startServer(t)
 	sender := client.NewHTTPSender(s.Addr, &http.Transport{
 		TLSClientConfig: rpc.LoadInsecureTLSConfig().Config(),
 	})
@@ -158,7 +152,7 @@ func TestMultiRangeScanInconsistent(t *testing.T) {
 	}
 
 	// Do an inconsistent scan from a new dist sender and verify it does
-	// the read at it's local clock and doesn't receive an
+	// the read at its local clock and doesn't receive an
 	// OpRequiresTxnError. We set the local clock to the timestamp of
 	// the first key to verify it's used to read only key "a".
 	manual := hlc.NewManualClock(ts[1].WallTime - 1)

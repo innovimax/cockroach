@@ -27,23 +27,26 @@ import (
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/util"
 	gogoproto "github.com/gogo/protobuf/proto"
 	yaml "gopkg.in/yaml.v1"
 )
 
 func createTestClient(addr string) *client.KV {
+	context := client.NewContext()
+	context.User = storage.UserRoot
 	transport := &http.Transport{TLSClientConfig: rpc.LoadInsecureTLSConfig().Config()}
-	return client.NewKV(nil, client.NewHTTPSender(addr, transport))
+	return client.NewKV(context, client.NewHTTPSender(addr, transport))
 }
 
 // TestKVDBCoverage verifies that all methods may be invoked on the
 // key value database.
 func TestKVDBCoverage(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(s.Addr)
 	key := proto.Key("a")
 	value1 := []byte("value1")
 	value2 := []byte("value2")
@@ -158,8 +161,8 @@ func TestKVDBCoverage(t *testing.T) {
 // TestKVDBInternalMethods verifies no internal methods are available
 // HTTP DB interface.
 func TestKVDBInternalMethods(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	testCases := []struct {
 		args  proto.Request
@@ -174,7 +177,7 @@ func TestKVDBInternalMethods(t *testing.T) {
 		{&proto.InternalTruncateLogRequest{}, &proto.InternalTruncateLogResponse{}},
 	}
 	// Verify non-public methods experience bad request errors.
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(s.Addr)
 	for i, test := range testCases {
 		test.args.Header().Key = proto.Key("a")
 		err := kvClient.Run(&client.Call{Args: test.args, Reply: test.reply})
@@ -189,10 +192,10 @@ func TestKVDBInternalMethods(t *testing.T) {
 // TestKVDBEndTransactionWithTriggers verifies that triggers are
 // disallowed on call to EndTransaction.
 func TestKVDBEndTransactionWithTriggers(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(s.Addr)
 	txnOpts := &client.TransactionOptions{Name: "test"}
 	err := kvClient.RunTransaction(txnOpts, func(txn *client.Txn) error {
 		// Make an EndTransaction request which would fail if not
@@ -219,8 +222,8 @@ func TestKVDBEndTransactionWithTriggers(t *testing.T) {
 // TestKVDBContentTypes verifies all combinations of request /
 // response content encodings are supported.
 func TestKVDBContentType(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	putReq := &proto.PutRequest{
 		RequestHeader: proto.RequestHeader{
@@ -261,7 +264,7 @@ func TestKVDBContentType(t *testing.T) {
 			t.Fatalf("%d: %s", i, err)
 		}
 		// Send a Put request but with non-canonical capitalization.
-		httpReq, err := http.NewRequest("POST", "http://"+addr+kv.DBPrefix+"Put", bytes.NewReader(body))
+		httpReq, err := http.NewRequest("POST", "http://"+s.Addr+kv.DBPrefix+"Put", bytes.NewReader(body))
 		if err != nil {
 			t.Fatalf("%d: %s", i, err)
 		}
@@ -290,10 +293,10 @@ func TestKVDBContentType(t *testing.T) {
 // TestKVDBTransaction verifies that transactions work properly over
 // the KV DB endpoint.
 func TestKVDBTransaction(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(s.Addr)
 
 	key := proto.Key("db-txn-test")
 	value := []byte("value")

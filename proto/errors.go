@@ -42,7 +42,7 @@ func (e *Error) CanRestartTransaction() TransactionRestart {
 
 // Error formats error.
 func (e *NotLeaderError) Error() string {
-	return fmt.Sprintf("range not leader; leader is %+v", e.Leader)
+	return fmt.Sprintf("replica not leader; leader is %s", e.Leader)
 }
 
 // NewRangeNotFoundError initializes a new RangeNotFoundError.

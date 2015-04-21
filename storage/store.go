@@ -25,6 +25,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -546,13 +547,30 @@ func (s *Store) maybeSplitRangesByConfigs(configMap PrefixConfigMap) {
 
 // ForceReplicationScan iterates over all ranges and enqueues any that need to be
 // replicated. Exposed only for testing.
-func (s *Store) ForceReplicationScan() {
+func (s *Store) ForceReplicationScan(t testing.TB) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, r := range s.ranges {
 		s.replicateQueue.MaybeAdd(r, s.clock.Now())
 	}
+}
+
+// WaitForRange waits for the specified range to acquire the
+// leader lease. Exposed only for testing.
+func (s *Store) WaitForRange(raftID int64, t testing.TB) {
+	// Make sure the group is active before trying this.
+	r, err := s.GetRange(raftID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.startGroup(raftID)
+	util.SucceedsWithin(t, 1*time.Second, func() error {
+		if held, _ := r.HasLeaderLease(); held {
+			return nil
+		}
+		return util.Errorf("range %d failed to get leader lease", raftID)
+	})
 }
 
 // setRangesMaxBytes sets the max bytes for every range according
@@ -790,12 +808,9 @@ func (s *Store) SplitRange(origRng, newRng *Range) error {
 	copy.EndKey = append([]byte(nil), newRng.Desc().StartKey...)
 	origRng.SetDesc(&copy)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.addRangeInternal(newRng, true)
-	s.mu.Unlock()
 	if err != nil {
-		return err
-	}
-	if err := s.startGroup(newRng.Desc().RaftID); err != nil {
 		return err
 	}
 	return nil
@@ -838,14 +853,10 @@ func (s *Store) MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsume
 // AddRange adds the range to the store's range map and to the sorted
 // rangesByKey slice.
 func (s *Store) AddRange(rng *Range) error {
-	log.Errorf("adding range")
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.addRangeInternal(rng, true)
-	s.mu.Unlock()
 	if err != nil {
-		return err
-	}
-	if err := s.startGroup(rng.Desc().RaftID); err != nil {
 		return err
 	}
 	return nil
@@ -1081,7 +1092,10 @@ func (s *Store) maybeResolveWriteIntentError(rng *Range, method string, args pro
 // startGroup creates and starts the given Raft group.
 // Calls to existing groups are allowed, but have no effect.
 func (s *Store) startGroup(raftID int64) error {
-	return s.multiraft.CreateGroup(uint64(raftID))
+	if s.multiraft != nil {
+		return s.multiraft.CreateGroup(uint64(raftID))
+	}
+	return nil
 }
 
 // ProposeRaftCommand submits a command to raft. The command is processed
@@ -1167,8 +1181,6 @@ func (s *Store) processRaft() {
 						log.Warning(err)
 						continue
 					}
-					// TODO(tschottdorf)
-					r.election <- struct{}{}
 					if e.NodeID != s.RaftNodeID() {
 						// TODO(tschottdorf): Fatalf if we think we have a leader
 						// lease for that group, during which we're not supposed to
@@ -1178,8 +1190,8 @@ func (s *Store) processRaft() {
 						// }
 						continue
 					}
-
-					r.requestLeaderLease(e.Term)
+					log.Infof("requesting leader lease")
+					go r.requestLeaderLease(e.Term)
 
 					// Done with this event, go back to listening on the channel.
 					continue
@@ -1246,6 +1258,18 @@ func (s *Store) AppliedIndex(groupID uint64) (uint64, error) {
 		return 0, util.Errorf("range %d not found", groupID)
 	}
 	return atomic.LoadUint64(&r.appliedIndex), nil
+}
+
+// LeaderLease implements the multiraft.StateMachine interface.
+// TODO(tobias): use this from multiraft.
+func (s *Store) LeaderLease(groupID uint64) (*proto.Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.ranges[int64(groupID)]
+	if !ok {
+		return nil, util.Errorf("range %d not found", groupID)
+	}
+	return r.getLease(), nil
 }
 
 func raftEntryFormatter(data []byte) string {

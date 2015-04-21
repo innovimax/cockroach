@@ -13,7 +13,7 @@
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
-// Author:
+// Author: Tobias Schottdorf
 
 package storage
 
@@ -34,7 +34,7 @@ func TestAcquireLeaderLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rng1.WaitForElection()
+	store.WaitForRange(1, t)
 	var lease *proto.Lease
 	if err := util.IsTrueWithin(func() bool {
 		lease = rng1.getLease()

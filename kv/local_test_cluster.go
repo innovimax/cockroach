@@ -56,7 +56,7 @@ func (rls *retryableLocalSender) Send(call *client.Call) {
 	// range split, which is exposed here as a RangeKeyMismatchError.
 	// If we fail with two in a row, it's a fatal test error.
 	retryOpts := util.RetryOptions{
-		Tag:         fmt.Sprintf("routing %s locally", call.Method),
+		Tag:         fmt.Sprintf("routing %s locally", call.Method()),
 		MaxAttempts: 2,
 	}
 	err := util.RetryWithBackoff(retryOpts, func() (util.RetryStatus, error) {
@@ -84,9 +84,7 @@ func (rls *retryableLocalSender) Send(call *client.Call) {
 // usage of a LocalTestCluster follows:
 //
 //   s := &server.LocalTestCluster{}
-//   if err := s.Start(); err != nil {
-//     t.Fatal(err)
-//   }
+//   s.Start(t)
 //   defer s.Stop()
 //
 // Note that the LocalTestCluster is different from server.TestCluster
@@ -108,7 +106,7 @@ type LocalTestCluster struct {
 // node RPC server and all HTTP endpoints. Use the value of
 // TestServer.Addr after Start() for client connections. Use Stop()
 // to shutdown the server after the test completes.
-func (ltc *LocalTestCluster) Start() error {
+func (ltc *LocalTestCluster) Start(t testing.TB) {
 	ltc.Manual = hlc.NewManualClock(0)
 	ltc.Clock = hlc.NewClock(ltc.Manual.UnixNano)
 	rpcContext := rpc.NewContext(ltc.Clock, rpc.LoadInsecureTLSConfig())
@@ -123,24 +121,19 @@ func (ltc *LocalTestCluster) Start() error {
 	ltc.Stopper.AddCloser(transport)
 	ltc.Store = storage.NewStore(ltc.Clock, ltc.Eng, ltc.KV, ltc.Gossip, transport, storage.TestStoreConfig)
 	if err := ltc.Store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, ltc.Stopper); err != nil {
-		return err
+		t.Fatalf("unable to start local test cluster: %s", err)
 	}
 	ltc.lSender.AddStore(ltc.Store)
 	if err := ltc.Store.BootstrapRange(); err != nil {
-		return err
+		t.Fatalf("unable to start local test cluster: %s", err)
 	}
 	if err := ltc.Store.Start(ltc.Stopper); err != nil {
-		return err
-	}
-	rng, err := ltc.Store.GetRange(1)
-	if err != nil {
-		return err
+		t.Fatalf("unable to start local test cluster: %s", err)
 	}
 	// Without this, we'll very sporadically have test failures here since
 	// Raft commands are retried, bypassing the response cache.
 	// TODO(tschottdorf): remove the trigger when we've fixed the above.
-	rng.WaitForElection()
-	return nil
+	ltc.Store.WaitForRange(1, t)
 }
 
 // Stop stops the cluster.

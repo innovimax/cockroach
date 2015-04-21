@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
-	"math"
 	"math/rand"
 	"reflect"
 	"sync"
@@ -168,8 +167,6 @@ type RangeManager interface {
 	ProposeRaftCommand(cmdIDKey, proto.InternalRaftCommand) <-chan error
 	RemoveRange(rng *Range) error
 	SplitRange(origRng, newRng *Range) error
-
-	startGroup(raftID int64) error
 }
 
 // A Range is a contiguous keyspace with writes managed via an
@@ -191,8 +188,6 @@ type Range struct {
 	// Last index applied to the state machine. Updated atomically.
 	appliedIndex uint64
 	lease        unsafe.Pointer // Information for leader lease, updated atomically
-	// TODO(tschottdorf)
-	election chan struct{}
 
 	sync.RWMutex                 // Protects the following fields (and Desc)
 	cmdQ         *CommandQueue   // Enforce at most one command is running per key(s)
@@ -211,7 +206,6 @@ func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
 		tsCache:     NewTimestampCache(rm.Clock()),
 		respCache:   NewResponseCache(desc.RaftID, rm.Engine()),
 		pendingCmds: map[cmdIDKey]*pendingCmd{},
-		election:    make(chan struct{}, 100),
 	}
 	r.SetDesc(desc)
 
@@ -225,6 +219,12 @@ func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
 		return nil, err
 	}
 	atomic.StoreUint64(&r.appliedIndex, appliedIndex)
+
+	lease, err := loadLeaderLease(r.rm.Engine(), desc.RaftID)
+	if err != nil {
+		return nil, err
+	}
+	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
 
 	if r.stats, err = newRangeStats(desc.RaftID, rm.Engine()); err != nil {
 		return nil, err
@@ -246,12 +246,11 @@ func (r *Range) start() {
 		r.maybeGossipClusterID()
 		r.maybeGossipFirstRange()
 	}
-	// TODO(spencer): need to properly seed all unittests.
-	r.setLeaderLease(&proto.Lease{
-		Expiration: math.MaxInt64,
-		RaftNodeID: uint64(r.rm.RaftNodeID()),
-		Term:       1,
-	})
+	if r.Desc().StartKey.Less(engine.KeySystemMax) {
+		r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
+			return r.ContainsKey(configPrefix)
+		})
+	}
 }
 
 // Destroy cleans up all data associated with this range.
@@ -290,11 +289,37 @@ func (r *Range) getLease() *proto.Lease {
 // replica for the last known holder of the leader lease.
 func (r *Range) newNotLeaderError() error {
 	err := &proto.NotLeaderError{}
-	if l := r.getLease(); l != nil {
+	if l := r.getLease(); l.RaftNodeID != 0 {
 		_, storeID := DecodeRaftNodeID(multiraft.NodeID(l.RaftNodeID))
 		_, err.Leader = r.Desc().FindReplica(storeID)
 	}
 	return err
+}
+
+// requestLeaderLease sends a request to obtain or extend a leader lease for
+// this replica.
+func (r *Range) requestLeaderLease(term uint64) {
+	// Register a stopper task while lease request is in flight.
+	if !r.rm.Stopper().StartTask() {
+		return
+	}
+	defer r.rm.Stopper().FinishTask()
+	// Prepare a Raft command to get a leader lease for the replica
+	// of that group that lives in our store.
+	wallTime := r.rm.Clock().PhysicalNow()
+	// TODO: get duration from configuration, either as a config flag
+	// or, later, dynamically adjusted.
+	duration := int64(defaultLeaderLeaseDuration)
+	args := &proto.InternalLeaderLeaseRequest{
+		RequestHeader: proto.RequestHeader{Key: r.Desc().StartKey},
+		Lease: proto.Lease{
+			Expiration: wallTime + duration,
+			Duration:   duration,
+			Term:       term,
+			RaftNodeID: uint64(r.rm.RaftNodeID()),
+		},
+	}
+	r.AddCmd(proto.InternalLeaderLease, args, &proto.InternalLeaderLeaseResponse{}, true)
 }
 
 // HasLeaderLease returns whether the leader lease is held by this
@@ -303,7 +328,7 @@ func (r *Range) newNotLeaderError() error {
 // no other replica may be the leader either. Leases may not overlap,
 // though a gap between successive lease holders is expected.
 func (r *Range) HasLeaderLease() (bool, uint64) {
-	if l := r.getLease(); l != nil {
+	if l := r.getLease(); l.RaftNodeID != 0 {
 		if l.RaftNodeID == uint64(r.rm.RaftNodeID()) &&
 			r.rm.Clock().PhysicalNow() < l.Expiration {
 			return true, l.Term
@@ -315,66 +340,12 @@ func (r *Range) HasLeaderLease() (bool, uint64) {
 
 // AnotherHasLeaderLease returns whether a replica other than this one
 // is known to be the holder of the lease. We account for clock offset.
-func (r *Range) AnotherHasLeaderLease() bool {
-	if l := r.getLease(); l != nil {
-		if l.RaftNodeID != uint64(r.rm.RaftNodeID()) &&
-			r.rm.Clock().PhysicalNow() < l.Expiration+int64(r.rm.Clock().MaxOffset()) {
-			return true
-		}
+func (r *Range) AnotherHasLeaderLease() (held, expired bool) {
+	if l := r.getLease(); l.RaftNodeID != 0 {
+		held = l.RaftNodeID != uint64(r.rm.RaftNodeID())
+		expired = r.rm.Clock().PhysicalNow() >= l.Expiration+int64(r.rm.Clock().MaxOffset())
 	}
-	return false
-}
-
-// setLeaderLease sets the lease expiration for this range replica,
-// until which, subsequent calls to HasLeaderLease() will return
-// true. If this range replica is already the lease holder, the
-// expiration will be extended as indicated. Otherwise, all duties
-// required of the range leader are commenced, including gossiping
-// cluster and config info where appropriate and clearing the command
-// queue and timestamp cache.
-//
-// TODO(tobias): call this method when processing the lease command
-// in Range.executeCmd().
-func (r *Range) setLeaderLease(lease *proto.Lease) {
-	r.Lock()
-	defer r.Unlock()
-
-	// Set the new leader lease.
-	oldLease := r.getLease()
-	if oldLease != nil && lease.Term < oldLease.Term {
-		return
-	}
-	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
-
-	// If this replica holds the lease and it's being granted as part of
-	// a new term, as opposed to renewed before having expired, start
-	// gossiping if we're the first range.
-	if held, term := r.HasLeaderLease(); held {
-		if oldLease == nil || term > oldLease.Term {
-			// Gossip configs in the event this range contains config info.
-			r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
-				return r.ContainsKey(configPrefix)
-			})
-			// Only start gossiping if this range is the first range.
-			if r.IsFirstRange() {
-				go r.startGossip(lease.Term, r.rm.Stopper())
-			}
-		}
-		// Update the low water mark in the timestamp cache if the prior
-		// lease holder was not this replica. We add the maximum clock
-		// offset to account for any difference in clocks between the
-		// expiration (set by a remote node) and this node.
-		if oldLease != nil && oldLease.RaftNodeID != lease.RaftNodeID {
-			r.tsCache.SetLowWater(proto.Timestamp{
-				WallTime: oldLease.Expiration + int64(r.rm.Clock().MaxOffset()),
-			})
-		}
-	} else {
-		// Clear the command queue as another replica has the lease. All
-		// waiting read-only commands will be freed up to complete, and
-		// will fail with NotLeaderError.
-		r.cmdQ.Clear()
-	}
+	return
 }
 
 // isInitialized is true if we know the metadata of this range, either
@@ -525,8 +496,10 @@ func (r *Range) addReadOnlyCmd(method string, args proto.Request, reply proto.Re
 	held, prevTerm := r.HasLeaderLease()
 	if !held {
 		// If we don't hold the lease, but nobody else does either, submit
-		// this read-only command as read-write to trigger an election.
-		if !r.AnotherHasLeaderLease() {
+		// this read-only command as read-write. The read will only succeed
+		// if this replica is the leader, and the command queue and read
+		// timestamp cache are both updated the same as if we had the lease.
+		if anotherHeld, _ := r.AnotherHasLeaderLease(); !anotherHeld {
 			return r.addReadWriteCmd(method, args, reply, true)
 		}
 		reply.Header().SetGoError(r.newNotLeaderError())
@@ -600,22 +573,10 @@ func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.R
 	}
 
 	// For read/write commands, we check the leader lease. If we know of
-	// a lease and the holder is not this replica, and we're within the
-	// lease expiration, return NotLeaderError. In all other cases, we
-	// want to continue. Either we're the lease holder, or were the last
-	// lease holder, or we weren't the last but we'd like to become the
-	// leader because this replica is where there's write pressure.
-	if r.AnotherHasLeaderLease() {
+	// a lease and the holder is not this replica, return NotLeaderError.
+	if held, _ := r.AnotherHasLeaderLease(); held {
 		reply.Header().SetGoError(r.newNotLeaderError())
 		return reply.Header().GoError()
-	}
-	// If we don't have the lease and nobody else does, propose the
-	// command to force an election. We want this write pressure to
-	// reorient the leader to be closer to the requesting clients.
-	if held, _ := r.HasLeaderLease(); !held {
-		// TODO(bdarnell): will proposing the command if we don't have
-		// leadership just throw out the command? Do we have to start an
-		// election on behalf of this replica somehow?
 	}
 
 	// Add the write to the command queue to gate subsequent overlapping
@@ -797,7 +758,7 @@ func (r *Range) maybeGossipFirstRange() {
 // Configuration maps include accounting, permissions, and zones.
 func (r *Range) maybeGossipConfigs(match func(configPrefix proto.Key) bool) {
 	if r.rm.Gossip() != nil {
-		if held, _ := r.HasLeaderLease(); held {
+		if held, term := r.HasLeaderLease(); held || term == 0 {
 			for _, cd := range configDescriptors {
 				if match(cd.keyPrefix) {
 					// Check for a bad range split. This should never happen as ranges
@@ -923,7 +884,7 @@ func (r *Range) executeCmd(index uint64, method string, args proto.Request,
 	case proto.InternalTruncateLog:
 		r.InternalTruncateLog(batch, &ms, args.(*proto.InternalTruncateLogRequest), reply.(*proto.InternalTruncateLogResponse))
 	case proto.InternalLeaderLease:
-		r.InternalLeaderLease(args.(*proto.InternalLeaderLeaseRequest), reply.(*proto.InternalLeaderLeaseResponse))
+		r.InternalLeaderLease(batch, &ms, args.(*proto.InternalLeaderLeaseRequest), reply.(*proto.InternalLeaderLeaseResponse))
 	default:
 		return util.Errorf("unrecognized command %s", method)
 	}
@@ -1536,60 +1497,60 @@ func (r *Range) InternalTruncateLog(batch engine.Engine, ms *engine.MVCCStats, a
 	reply.SetGoError(err)
 }
 
-// InternalLeaderLease evaluates and responds to a request to grant a leader lease.
-func (r *Range) InternalLeaderLease(args *proto.InternalLeaderLeaseRequest, reply *proto.InternalLeaderLeaseResponse) {
-	// TODO(tschottdorf) stub for now to get tests working.
-	r.setLease(&args.Lease)
-	// r.grantLeaderLease(args.Lease)
-}
+// InternalLeaderLease sets the leader lease for this range. After a
+// lease has been set, calls to HasLeaderLease() will return true if
+// this replica is the lease holder and the lease has not yet
+// expired. If this range replica is already the lease holder, the
+// expiration will be extended as indicated. Otherwise, all duties
+// required of the range leader are commenced, including gossiping
+// cluster and config info where appropriate and clearing the command
+// queue and timestamp cache.
+func (r *Range) InternalLeaderLease(batch engine.Engine, ms *engine.MVCCStats, args *proto.InternalLeaderLeaseRequest, reply *proto.InternalLeaderLeaseResponse) {
+	r.Lock()
+	defer r.Unlock()
 
-// requestLeaderLease sends a request to obtain or extend a leader lease for
-// this replica. Being a first mover, it registers itself as a task with the
-// stopper.
-func (r *Range) requestLeaderLease(term uint64) {
-	if !r.stopper.StartTask() {
+	// Set the new leader lease.
+	oldLease := r.getLease()
+	if args.Lease.Term < oldLease.Term {
+		reply.SetGoError(util.Errorf("lease term %d older than last granted lease %d", args.Lease.Term, oldLease.Term))
 		return
 	}
-	defer r.stopper.FinishTask()
-	// Prepare a Raft command to get a leader lease for the replica
-	// of that group that lives in our store.
-	wallTime := r.rm.Clock().PhysicalNow()
-	// TODO: get this from configuration, either as a config flag
-	// or, later, dynamically adjusted.
-	duration := int64(defaultLeaderLeaseDuration)
-	idKey := makeCmdIDKey(proto.ClientCmdID{
-		WallTime: wallTime,
-		Random:   rand.Int63(),
-	})
-	cmd := proto.InternalRaftCommand{
-		RaftID: r.Desc().RaftID,
+	// Store the lease to disk & in-memory.
+	if err := engine.MVCCPutProto(batch, nil, engine.RaftLeaderLeaseKey(r.Desc().RaftID), proto.ZeroTimestamp, nil, &args.Lease); err != nil {
+		reply.SetGoError(err)
+		return
 	}
-	args := &proto.InternalLeaderLeaseRequest{
-		RequestHeader: proto.RequestHeader{Key: r.Desc().StartKey},
-		Lease: proto.Lease{
-			Expiration: wallTime + duration,
-			Duration:   duration,
-			Term:       term,
-			RaftNodeID: uint64(r.rm.RaftNodeID()),
-		},
-	}
+	atomic.StorePointer(&r.lease, unsafe.Pointer(&args.Lease))
 
-	cmd.Cmd.SetValue(args)
-
-	// Propose the Raft command.
-	errCh := r.rm.ProposeRaftCommand(idKey, cmd)
-
-	// Make sure we log a potential error from Raft.
-	r.stopper.RunWorker(func() {
-		select {
-		case err := <-errCh:
-			if err != nil {
-				log.Warning(err)
+	// If this replica holds the lease and it's being granted as part of
+	// a new term, as opposed to renewed before having expired, start
+	// gossiping if we're the first range.
+	if held, term := r.HasLeaderLease(); held {
+		if oldLease == nil || term > oldLease.Term {
+			// Gossip configs in the event this range contains config info.
+			r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
+				return r.ContainsKey(configPrefix)
+			})
+			// Only start gossiping if this range is the first range.
+			if r.IsFirstRange() {
+				go r.startGossip(term, r.rm.Stopper())
 			}
-		case <-r.stopper.ShouldStop():
-			return
 		}
-	})
+		// Update the low water mark in the timestamp cache if the prior
+		// lease holder was not this replica. We add the maximum clock
+		// offset to account for any difference in clocks between the
+		// expiration (set by a remote node) and this node.
+		if oldLease != nil && oldLease.RaftNodeID != args.Lease.RaftNodeID {
+			r.tsCache.SetLowWater(proto.Timestamp{
+				WallTime: oldLease.Expiration + int64(r.rm.Clock().MaxOffset()),
+			})
+		}
+	} else {
+		// Clear the command queue as another replica has the lease. All
+		// waiting read-only commands will be freed up to complete, and
+		// will fail with NotLeaderError.
+		r.cmdQ.Clear()
+	}
 }
 
 // splitTrigger is called on a successful commit of an AdminSplit
@@ -1888,6 +1849,14 @@ func loadAppliedIndex(eng engine.Engine, raftID int64) (uint64, error) {
 		_, appliedIndex = encoding.DecodeUint64(v.Bytes)
 	}
 	return appliedIndex, nil
+}
+
+func loadLeaderLease(eng engine.Engine, raftID int64) (*proto.Lease, error) {
+	lease := &proto.Lease{}
+	if _, err := engine.MVCCGetProto(eng, engine.RaftLeaderLeaseKey(raftID), proto.ZeroTimestamp, true, nil, lease); err != nil {
+		return nil, err
+	}
+	return lease, nil
 }
 
 // Snapshot implements the raft.Storage interface.
@@ -2328,13 +2297,4 @@ func (r *Range) ChangeReplicas(changeType proto.ReplicaChangeType, replica proto
 		return util.Errorf("change replicas of %d failed: %s", desc.RaftID, err)
 	}
 	return nil
-}
-
-// WaitForElection waits for an election event to reach this Range.
-// It is mostly useful for testing.
-func (r *Range) WaitForElection() {
-	// Make sure the group is active before trying this.
-	r.rm.startGroup(r.Desc().RaftID)
-	<-r.election
-	return
 }

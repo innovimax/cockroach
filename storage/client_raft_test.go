@@ -468,7 +468,7 @@ func TestStoreRangeReplicate(t *testing.T) {
 	mtc.stores[0].WaitForNodes(3)
 
 	// Once we know our peers, trigger a scan.
-	mtc.stores[0].ForceReplicationScan()
+	mtc.stores[0].ForceReplicationScan(t)
 
 	// The range should become available on every node.
 	if err := util.IsTrueWithin(func() bool {

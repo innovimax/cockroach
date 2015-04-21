@@ -561,7 +561,7 @@ func TestStoreExecuteCmdOutOfRange(t *testing.T) {
 	// This shouldn't be necessary, but without it, the range sometimes
 	// gets removed before the election is finished, and then Raft panics.
 	// See #702.
-	rng.WaitForElection()
+	store.WaitForRange(rng.Desc().RaftID, t)
 	if err := store.RemoveRange(rng); err != nil {
 		t.Fatal(err)
 	}

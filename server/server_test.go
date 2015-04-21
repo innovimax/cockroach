@@ -44,9 +44,7 @@ var testContext = NewContext()
 // it will end up having two logical ranges.
 func startTestServer(t *testing.T) *TestServer {
 	s := &TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Could not start server: %v", err)
-	}
+	s.Start(t)
 	log.Infof("Test server listening on http: %s", s.Addr)
 	return s
 }

@@ -214,7 +214,7 @@ func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHead
 	}
 	permMap := configMap.(storage.PrefixConfigMap)
 	headerEnd := header.EndKey
-	if headerEnd == nil {
+	if len(headerEnd) == 0 {
 		headerEnd = header.Key
 	}
 	// Visit PermConfig(s) which apply to the method's key range.
@@ -243,6 +243,9 @@ func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHead
 				return true, nil
 			})
 			if !hasPerm {
+				if len(header.EndKey) == 0 {
+					return false, util.Errorf("user %q cannot invoke %s at %q", header.User, method, start)
+				}
 				return false, util.Errorf("user %q cannot invoke %s at %q-%q", header.User, method, start, end)
 			}
 			return false, nil

@@ -45,9 +45,7 @@ import (
 
 func StartTestServer(t *testing.T) *server.TestServer {
 	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Could not start server: %v", err)
-	}
+	s.Start(t)
 	log.Infof("Test server listening on http: %s", s.Addr)
 	return s
 }
@@ -741,9 +739,7 @@ func setupClientBenchData(numVersions, numKeys int, b *testing.B) (*server.TestS
 	s := &server.TestServer{}
 	s.SkipBootstrap = exists
 	s.Engine = engine.NewRocksDB(proto.Attributes{Attrs: []string{"ssd"}}, loc, cacheSize)
-	if err := s.Start(); err != nil {
-		b.Fatalf("Could not start server: %v", err)
-	}
+	s.Start(b)
 
 	kv := createTestClient(s.Addr)
 	kv.User = storage.UserRoot
