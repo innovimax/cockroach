@@ -1,4 +1,4 @@
-// Copyright 2014 The Cockroach Authors.
+// Copyright 2015 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
@@ -260,7 +261,7 @@ type Store struct {
 	multiraft      *multiraft.MultiRaft
 	started        int32
 	stopper        *util.Stopper
-	status         *proto.StoreStatus
+	status         unsafe.Pointer
 
 	mu          sync.RWMutex     // Protects variables below...
 	ranges      map[int64]*Range // Map of ranges by Raft ID
@@ -341,12 +342,11 @@ func NewStore(ctx StoreContext, eng engine.Engine) *Store {
 		engine:      eng,
 		allocator:   newAllocator(sf.findStores),
 		ranges:      map[int64]*Range{},
-		status:      &proto.StoreStatus{},
+		status:      unsafe.Pointer(&proto.StoreStatus{}),
 	}
 
 	// Add range scanner and configure with queues.
-	s.scanner = newRangeScanner(ctx.ScanInterval, newStoreRangeIterator(s), s.
-		updateStoreStatus)
+	s.scanner = newRangeScanner(ctx.ScanInterval, newStoreRangeIterator(s), s.updateStoreStatus)
 	s.gcQueue = newGCQueue()
 	s.splitQueue = newSplitQueue(s.ctx.DB, s.ctx.Gossip)
 	s.verifyQueue = newVerifyQueue(s.scanner.Stats)
@@ -463,6 +463,14 @@ func (s *Store) Start(stopper *util.Stopper) error {
 	s.multiraft.Start(s.stopper)
 	s.processRaft()
 
+	// Update the store status values.
+	status := &proto.StoreStatus{
+		StoreID:   s.Ident.StoreID,
+		NodeID:    s.Ident.NodeID,
+		StartedAt: now.WallTime,
+	}
+	atomic.StorePointer(&s.status, unsafe.Pointer(status))
+
 	// Start the scanner.
 	s.scanner.Start(s.ctx.Clock, s.stopper)
 
@@ -479,11 +487,6 @@ func (s *Store) Start(stopper *util.Stopper) error {
 
 	// Set the started flag (for unittests).
 	atomic.StoreInt32(&s.started, 1)
-
-	// Update the store status values.
-	s.status.StoreID = s.Ident.StoreID
-	s.status.NodeID = s.Ident.NodeID
-	s.status.StartedAt = now.WallTime
 
 	return nil
 }
@@ -1272,15 +1275,36 @@ func raftEntryFormatter(data []byte) string {
 	return s
 }
 
+// WaitForRangeScanCompletion waits until the next range scan is complete and
+// returns the total number of scans completed so far.
+func (s *Store) WaitForRangeScanCompletion() int64 {
+	return s.scanner.WaitForScanCompletion()
+}
+
+// GetStatus fetches the current store status. If a range scan has not
+// completed yet, it will not contain any stats. The scan typically runs once
+// every 10 minutes.
+func (s *Store) GetStatus() proto.StoreStatus {
+	return *(*proto.StoreStatus)(atomic.LoadPointer(&s.status))
+}
+
 // updateStoreStatus updates the store's status proto.
 func (s *Store) updateStoreStatus() {
 	now := s.ctx.Clock.Now().WallTime
-	s.status.UpdatedAt = now
-	s.status.RangeCount = int32(len(s.ranges))
+	scannerStats := s.scanner.Stats()
+	oldStatus := s.GetStatus()
+	status := &proto.StoreStatus{
+		StoreID:    s.Ident.StoreID,
+		NodeID:     s.Ident.NodeID,
+		UpdatedAt:  now,
+		StartedAt:  oldStatus.StartedAt,
+		RangeCount: int32(scannerStats.RangeCount),
+		Stats:      proto.MVCCStats(scannerStats.MVCC),
+	}
+	atomic.StorePointer(&s.status, unsafe.Pointer(status))
 	key := engine.StoreStatusKey(int32(s.Ident.StoreID))
-	s.status.Stats = proto.MVCCStats(s.scanner.Stats().MVCC)
-	if err := s.ctx.DB.Run(client.PutProtoCall(key, s.status)); err != nil {
-		util.Error(err)
+	if err := s.ctx.DB.Run(client.PutProtoCall(key, status)); err != nil {
+		log.Error(err)
 	}
 }
 

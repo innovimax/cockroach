@@ -18,6 +18,7 @@
 package storage
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -71,13 +72,15 @@ type storeStats struct {
 // complete approximately one full scan per interval. Each range is
 // tested for inclusion in a sequence of prioritized range queues.
 type rangeScanner struct {
-	interval time.Duration  // Duration interval for scan loop
-	iter     rangeIterator  // Iterator to implement scan of ranges
-	queues   []rangeQueue   // Range queues managed by this scanner
-	removed  chan *Range    // Ranges to remove from queues
-	count    int64          // Count of times through the scanning loop
-	stats    unsafe.Pointer // Latest store stats object; updated atomically
-	scanFn   func()         // Function called at each complete scan iteration
+	interval      time.Duration  // Duration interval for scan loop
+	iter          rangeIterator  // Iterator to implement scan of ranges
+	queues        []rangeQueue   // Range queues managed by this scanner
+	removed       chan *Range    // Ranges to remove from queues
+	count         int64          // Count of times through the scanning loop
+	stats         unsafe.Pointer // Latest store stats object; updated atomically
+	scanFn        func()         // Function called at each complete scan iteration
+	completedScan *sync.Cond
+	totalScans    int64
 }
 
 // newRangeScanner creates a new range scanner with the provided loop interval,
@@ -85,11 +88,12 @@ type rangeScanner struct {
 // loop that function will be called.
 func newRangeScanner(interval time.Duration, iter rangeIterator, scanFn func()) *rangeScanner {
 	return &rangeScanner{
-		interval: interval,
-		iter:     iter,
-		removed:  make(chan *Range, 10),
-		stats:    unsafe.Pointer(&storeStats{RangeCount: iter.EstimatedCount()}),
-		scanFn:   scanFn,
+		interval:      interval,
+		iter:          iter,
+		removed:       make(chan *Range, 10),
+		stats:         unsafe.Pointer(&storeStats{RangeCount: iter.EstimatedCount()}),
+		scanFn:        scanFn,
+		completedScan: &sync.Cond{L: &sync.Mutex{}},
 	}
 }
 
@@ -126,6 +130,25 @@ func (rs *rangeScanner) Count() int64 {
 // when a range is removed (e.g. rebalanced or merged).
 func (rs *rangeScanner) RemoveRange(rng *Range) {
 	rs.removed <- rng
+}
+
+// TotalScans fetches the total number of scans completed by the range scanner.
+func (rs *rangeScanner) TotalScans() int64 {
+	rs.completedScan.L.Lock()
+	defer rs.completedScan.L.Unlock()
+	return rs.totalScans
+}
+
+// WaitForScanCompletion waits until the end of the next scan and returns the
+// total number of scans completed so far.
+func (rs *rangeScanner) WaitForScanCompletion() int64 {
+	rs.completedScan.L.Lock()
+	defer rs.completedScan.L.Unlock()
+	initalValue := rs.totalScans
+	for rs.totalScans == initalValue {
+		rs.completedScan.Wait()
+	}
+	return rs.totalScans
 }
 
 // scanLoop loops endlessly, scanning through ranges available via
@@ -173,6 +196,10 @@ func (rs *rangeScanner) scanLoop(clock *hlc.Clock, stopper *util.Stopper) {
 					if rs.scanFn != nil {
 						rs.scanFn()
 					}
+					rs.completedScan.L.Lock()
+					rs.totalScans++
+					rs.completedScan.Broadcast()
+					rs.completedScan.L.Unlock()
 					log.V(6).Infof("reset range scan iteration")
 				}
 				stopper.FinishTask()
